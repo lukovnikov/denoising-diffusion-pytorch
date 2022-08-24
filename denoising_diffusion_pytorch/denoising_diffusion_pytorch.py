@@ -418,7 +418,7 @@ class GaussianDiffusion(nn.Module):
         image_size,
         timesteps = 1000,
         sampling_timesteps = None,
-        loss_type = 'l1',
+        loss_type = 'l2',
         objective = 'pred_noise',
         beta_schedule = 'cosine',
         p2_loss_weight_gamma = 0., # p2 loss weight, from https://arxiv.org/abs/2204.00227 - 0 is equivalent to weight of 1 across time - 1. is recommended
