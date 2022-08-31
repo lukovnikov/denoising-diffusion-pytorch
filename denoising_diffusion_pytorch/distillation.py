@@ -26,7 +26,8 @@ from accelerate import Accelerator
 # constants
 from denoising_diffusion_pytorch.denoising_diffusion_pytorch import exists, WeightStandardizedConv2d, Block, default, \
     ResnetBlock, LearnedSinusoidalPosEmb, SinusoidalPosEmb, PreNorm, LinearAttention, Residual, Downsample, Attention, \
-    Upsample, GaussianDiffusion, unnormalize_to_zero_to_one, normalize_to_neg_one_to_one
+    Upsample, GaussianDiffusion, unnormalize_to_zero_to_one, normalize_to_neg_one_to_one, linear_beta_schedule, \
+    cosine_beta_schedule, extract
 
 ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
 
@@ -167,32 +168,6 @@ class Unet(nn.Module):
 
 # gaussian diffusion trainer class
 
-def extract(a, t, x_shape):
-    b, *_ = t.shape
-    out = a.gather(-1, t)
-    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
-
-
-def linear_beta_schedule(timesteps):
-    scale = 1000 / timesteps
-    beta_start = scale * 0.0001
-    beta_end = scale * 0.02
-    return torch.linspace(beta_start, beta_end, timesteps, dtype = torch.float64)
-
-
-def cosine_beta_schedule(timesteps, s = 0.008):
-    """
-    cosine schedule
-    as proposed in https://openreview.net/forum?id=-NEXDKk8gZ
-    """
-    steps = timesteps + 1
-    x = torch.linspace(0, timesteps, steps, dtype = torch.float64)
-    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
-    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-    return torch.clip(betas, 0, 0.999)
-
-
 class RollingDistillationGaussianDiffusion(nn.Module):
     def __init__(
         self,
@@ -307,30 +282,42 @@ class RollingDistillationGaussianDiffusion(nn.Module):
         return ModelPrediction(pred_noise, x_start)
 
     @torch.no_grad()
-    def ddim_sample(self, shape, clip_denoised = False):
+    def ddim_sample(self, shape, clip_denoised = False, x_T=None, return_trajectories=False):
         batch, device, total_timesteps, sampling_timesteps \
             = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps
 
-        times = torch.linspace(0., total_timesteps, steps = sampling_timesteps + 2)[:-1]  # [0,33,66]
+        imgacc = []
+        x0acc = []
+
+        times = torch.linspace(-1., total_timesteps-1, steps = sampling_timesteps + 1)  # [0,33,66]
         times = list(reversed(times.int().tolist()))   # [66, 33, 0]
         time_pairs = list(zip(times[:-1], times[1:]))  # [(66,33), (33,0)]
 
-        img = torch.randn(shape, device = device)
+        img = torch.randn(shape, device = device) if x_T is None else x_T
 
         for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
-            alpha_next = self.alphas_cumprod_prev[time_next]
-
-            time_cond = torch.full((batch,), time, device = device, dtype = torch.long)
-
+            time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
             pred_noise, x_start, *_ = self.model_predictions(img, time_cond, time=time)
 
             if clip_denoised:
                 x_start.clamp_(-1., 1.)
 
-            img = x_start * alpha_next.sqrt() + pred_noise * (1 - alpha_next).sqrt()
+            if time_next > -1:
+                alpha_next = self.alphas_cumprod[time_next]
+                img = x_start * alpha_next.sqrt() + pred_noise * (1 - alpha_next).sqrt()
+            else:
+                img = x_start
+
+            if return_trajectories:
+                imgacc.append(unnormalize_to_zero_to_one(img))
+                x0acc.append(unnormalize_to_zero_to_one(x_start))
 
         img = unnormalize_to_zero_to_one(img)
-        return img
+
+        if return_trajectories:
+            return img, times, imgacc, x0acc
+        else:
+            return img
 
     @torch.no_grad()
     def sample(self, batch_size = 16):
