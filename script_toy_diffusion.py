@@ -62,45 +62,13 @@ class DebugGaussianDiffusion(GaussianDiffusion):
                 sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
                 c = ((1 - alpha_next) - sigma ** 2).sqrt()
 
-                noise = torch.randn_like(img) if time_next > 0 else 0.
+                noise = torch.randn_like(img)
 
                 img = x_start * alpha_next.sqrt() + \
                       c * pred_noise + \
                       sigma * noise
             else:
                 img = x_start
-
-        # times = torch.linspace(0., total_timesteps, steps = sampling_timesteps + 2)[:-1]
-        # times = list(reversed(times.int().tolist()))
-        # time_pairs = list(zip(times[:-1], times[1:]))
-        #
-        # img = torch.randn(shape, device = device) if x_T is None else x_T
-        #
-        # x_start = None
-        #
-        # for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
-        #     alpha = self.alphas_cumprod_prev[time]
-        #     alpha_next = self.alphas_cumprod_prev[time_next]
-        #
-        #     time_cond = torch.full((batch,), time, device = device, dtype = torch.long)
-        #
-        #     self_cond = x_start if self.self_condition else None
-        #
-        #     pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond)
-        #
-        #     if clip_denoised:
-        #         x_start.clamp_(-1., 1.)
-        #
-        #     sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / max((1 - alpha), 1e-6)).sqrt()
-        #     c = ((1 - alpha_next) - sigma ** 2).sqrt()
-        #
-        #     noise = torch.randn_like(img) if time_next > 0 else 0.
-        #
-        #     img = x_start * alpha_next.sqrt() + \
-        #           c * pred_noise + \
-        #           sigma * noise
-        #
-
 
             imgacc.append(unnormalize_to_zero_to_one(img))
             x0acc.append(unnormalize_to_zero_to_one(x_start))

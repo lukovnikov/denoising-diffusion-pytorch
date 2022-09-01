@@ -1,3 +1,5 @@
+from itertools import repeat
+
 import torch
 import torch.nn as nn
 import matplotlib as mpl
@@ -11,43 +13,6 @@ import random
 from denoising_diffusion_pytorch import GaussianDiffusion
 from denoising_diffusion_pytorch.denoising_diffusion_pytorch import SinusoidalPosEmb, unnormalize_to_zero_to_one
 from denoising_diffusion_pytorch.distillation import RollingDistillationGaussianDiffusion
-
-
-class DebugGaussianDiffusion(RollingDistillationGaussianDiffusion):
-
-    @torch.no_grad()
-    def ddim_sample(self, shape, clip_denoised = None):
-        clip_denoised = (self.objective != "pred_x0") if clip_denoised is None else clip_denoised
-        batch, device, total_timesteps, sampling_timesteps, objective \
-            = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.objective
-
-        times = torch.linspace(0., total_timesteps, steps = sampling_timesteps + 2)[:-1]
-        times = list(reversed(times.int().tolist()))
-        time_pairs = list(zip(times[:-1], times[1:]))
-
-        img = torch.randn(shape, device = device)
-        imgacc = []
-        x0acc = []
-
-        for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
-            alpha_next = self.alphas_cumprod_prev[time_next]
-
-            time_cond = torch.full((batch,), time, device = device, dtype = torch.long)
-
-            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, time=time)
-
-            if clip_denoised:
-                x_start.clamp_(-1., 1.)
-
-            img = x_start * alpha_next.sqrt() + pred_noise * (1 - alpha_next).sqrt()
-            imgacc.append(unnormalize_to_zero_to_one(img))
-            x0acc.append(unnormalize_to_zero_to_one(x_start))
-
-        img = unnormalize_to_zero_to_one(img)
-        # if x_T is None:
-        #     return img, imgacc, x0acc
-        # else:
-        return img, times, imgacc, x0acc
 
 
 class OneDModel(torch.nn.Module):
@@ -116,11 +81,20 @@ class OneDDataset(torch.utils.data.Dataset):
             yield self[i]
 
 
-
+def repeater(dl):
+    for loader in repeat(dl):
+        for batch in loader:
+            yield batch
 
 
 def run():
-    m = OneDModel(64)
+    batsize=256
+    numsteps = 500
+    numjumps = 4
+    itersperstep=20
+    teacher = OneDModel(64, 3, notime=True)
+    students = [OneDModel(32, 3, notime=True) for _ in range(numjumps)]
+
     x = torch.randn((5, 1, 1, 1))
     t = torch.rand((5,))
     print(x, t)
@@ -128,10 +102,11 @@ def run():
     # y = m(x, t)
     # print(y)
 
-    diffusion = DebugGaussianDiffusion(model=m, image_size=1, timesteps=100, loss_type="l2")
+    diffusion = RollingDistillationGaussianDiffusion(
+        teacher=teacher, students=students, image_size=1, timesteps=numsteps, jumps=len(students))
 
     ds = OneDDataset()
-    dl = torch.utils.data.DataLoader(ds, batch_size=256)
+    dl = torch.utils.data.DataLoader(ds, batch_size=batsize)
 
     print(len(ds))
     samples = [x[0, 0, 0].item() for x in ds]
@@ -139,39 +114,73 @@ def run():
     # _ = plt.hist(samples, density=True, bins=100)
     # plt.show()
 
-    step = 0
-    epochs = 100
+    dliter = repeater(dl)
+    # for i in range(1000):
+    #     batch = next(dliter)
+    # print("done iterating")
+
+
+    inititers = 5 * itersperstep
+    iterschedule = [itersperstep for _ in range(numsteps)]
+    iterschedule[0] = inititers
+    iterschedule[-1] = inititers
+    totaliters = sum(iterschedule)
+    print(f"Total number of iterations: {totaliters} (~= {totaliters/len(dl)} epochs)")
 
     device = torch.device("cuda:0")
     diffusion.to(device)
-    done = False
 
-    optimizer = torch.optim.Adam(diffusion.parameters(), lr=1e-3, betas=(0.9, 0.99))
+    teacher_optimizer = torch.optim.Adam(diffusion.teacher.parameters(), lr=1e-3, betas=(0.9, 0.99))
 
-    with tqdm(initial=step, total=epochs * len(dl)) as pbar:
-        while not done:
-            losses = []
-            for batch in dl:
-                batch = batch.to(device)
+    initstep = 0
+    teacher_batchcount = 0
+    student_batchcount = 0
 
-                total_loss = 0.
+    with tqdm(initial=initstep, total=diffusion.num_timesteps) as pbar:
+        for step in reversed(range(initstep, diffusion.num_timesteps)):
+            teacher_losses = []
+            student_losses = []
 
-                loss = diffusion(batch)
+            # PHASE I: train teacher for current step
+            for i in range(iterschedule[step]):
+                batch = next(dliter).to(device)
+                teacher_batchcount += 1
+                loss = diffusion.forward_teacher(batch, time=step)
                 loss.backward()
-                losses.append(loss.cpu().item())
+                teacher_losses.append(loss.cpu().item())
+                teacher_optimizer.step()
+                teacher_optimizer.zero_grad()
 
-                pbar.set_description(f'loss: {np.mean(losses):.4f}')
+                pbar.set_description(f'Teacher loss: {np.mean(teacher_losses):.4f}, Updates: {teacher_batchcount}')
 
-                optimizer.step()
-                optimizer.zero_grad()
+            # # PHASE II: train student for current step
+            # newstudent = diffusion.set_current_time(step)
+            # if newstudent is not None:
+            #     student_optimizer = torch.optim.Adam(newstudent.parameters(), lr=1e-3, betas=(0.9, 0.99))
+            #
+            # for i in range(iterschedule[step]):
+            #     batch = next(dliter).to(device)
+            #     student_batchcount += 1
+            #     loss = diffusion.forward_student(batch, time=step)
+            #     loss.backward()
+            #     student_losses.append(loss.cpu().item())
+            #     student_optimizer.step()
+            #     student_optimizer.zero_grad()
+            #
+            #     pbar.set_description(f'Teacher loss: {np.mean(teacher_losses):.4f}, '
+            #                          f'Student loss: {np.mean(student_losses):.4f}, '
+            #                          f'Updates: {teacher_batchcount},{student_batchcount}')
 
-                step += 1
-                pbar.update(1)
+            pbar.update(1)
 
-                if step >= epochs * len(dl):
-                    done = True
-            if step % (len(dl) * 50) == 0:
-                print("")
+            if (step+1) % 10 == 0:
+                # print(f'\nTeacher loss: {np.mean(teacher_losses):.4f}, '
+                #                      f'Student loss: {np.mean(student_losses):.4f}, '
+                #                      f'Updates: {teacher_batchcount},{student_batchcount}')
+                print(f'\nTeacher loss: {np.mean(teacher_losses):.4f}, '
+                                     f'Updates: {teacher_batchcount}')
+
+
 
     print("done training")
 

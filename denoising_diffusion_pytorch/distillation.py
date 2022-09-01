@@ -173,20 +173,16 @@ class RollingDistillationGaussianDiffusion(nn.Module):
         self,
         teacher,
         students,
-        *,
         image_size,
         timesteps = 1000,
         jumps=8,
-        # sampling_timesteps = None,
         loss_type = 'l2',
         beta_schedule = 'cosine',
-        # p2_loss_weight_gamma = 0., # p2 loss weight, from https://arxiv.org/abs/2204.00227 - 0 is equivalent to weight of 1 across time - 1. is recommended
-        # p2_loss_weight_k = 1,
     ):
         super().__init__()
 
         self.teacher = teacher
-        self.students = torch.nn.ModuleList(*students)
+        self.students = torch.nn.ModuleList(students)
         self.channels = self.teacher.channels
         self.self_condition = self.teacher.self_condition
 
@@ -247,7 +243,7 @@ class RollingDistillationGaussianDiffusion(nn.Module):
 
         # register_buffer('p2_loss_weight', (p2_loss_weight_k + alphas_cumprod / (1 - alphas_cumprod)) ** -p2_loss_weight_gamma)
 
-        self.register_buffer('current_time', torch.tensor([0], dtype=torch.long))
+        self.register_buffer('current_time', torch.tensor([-1], dtype=torch.long))
         self.current_student = None
 
     def predict_start_from_noise(self, x_t, t, noise):
@@ -273,7 +269,7 @@ class RollingDistillationGaussianDiffusion(nn.Module):
 
     def model_predictions(self, x, t, time=None):
         # select the right student
-        model = self.get_student(time)
+        model, student_i = self.get_student(time)
         model_output = model(x, t)
 
         pred_noise = self.predict_noise_from_start(x, t, model_output)
@@ -289,9 +285,9 @@ class RollingDistillationGaussianDiffusion(nn.Module):
         imgacc = []
         x0acc = []
 
-        times = torch.linspace(-1., total_timesteps-1, steps = sampling_timesteps + 1)  # [0,33,66]
-        times = list(reversed(times.int().tolist()))   # [66, 33, 0]
-        time_pairs = list(zip(times[:-1], times[1:]))  # [(66,33), (33,0)]
+        times = torch.linspace(-1., total_timesteps-1, steps = sampling_timesteps + 1)
+        times = list(reversed(times.int().tolist()))
+        time_pairs = list(zip(times[:-1], times[1:]))
 
         img = torch.randn(shape, device = device) if x_T is None else x_T
 
@@ -358,58 +354,73 @@ class RollingDistillationGaussianDiffusion(nn.Module):
         else:
             raise ValueError(f'invalid loss type {self.loss_type}')
 
-    def p_losses(self, x_start, t, noise = None):
-        noise = default(noise, lambda: torch.randn_like(x_start))
+    # HOW TO TRAIN THIS:
+    # .forward_teacher() returns the loss of the teacher for a given image batch
+    # .forward_student() returns the loss for the current student for a given image batch
+    # .set_current_time() configures the current student according to the given time step
+    # - training sequence: start with time=0 and repeat the iteration:
+    #       Phase I: train teacher by calling .forward_teacher() and backpropagating with a number of batches
+    #       Phase II: train student:
+    #           1. call .set_current_time(t)  --> this makes sure self.current_student is set
+    #               if the returned value is None, the current student is the same as it was
+    #                                 ... is not None, then the student changed and we have to create a new optimizer!
+    #           2. call .forward_student()    --> this distills teacher into student
+    #           3. repeat steps 1 and 2 for a certain number of batches
+    #       Set t <- t + 1 and repeat Phases I and II
 
-        # noise sample
-        x = self.q_sample(x_start = x_start, t = t, noise = noise)
-
-        # predict and take gradient step
-        model_out = self.teacher(x, t)
-
-        loss = self.loss_fn(model_out, x_start, reduction = 'none')
-        loss = reduce(loss, 'b ... -> b (...)', 'mean')
-
-        return loss.mean()
-
-    def forward_teacher(self, img, time=None):
+    def forward_teacher(self, img, time=None, x_T=None):
         time = time if time is not None else self.current_time.item()
         b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
         assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
         t = torch.full((b,), time, device=device).long()
 
         img = normalize_to_neg_one_to_one(img)
-        return self.p_losses(img, t)
 
-    def forward_student(self, img, time=None):
+        noise = torch.randn_like(img) if x_T is None else x_T
+
+        # noise sample
+        x = self.q_sample(x_start=img, t=t, noise=noise)
+
+        # predict and take gradient step
+        model_out = self.teacher(x, t)
+
+        loss = self.loss_fn(model_out, img, reduction='none')
+        loss = reduce(loss, 'b ... -> b (...)', 'mean')
+
+        return loss.mean()
+
+    def get_student(self, time):
+        student_i = int(math.floor(self.num_jumps * time / self.num_timesteps))
+        return self.students[student_i], student_i
+
+    def forward_student(self, img, time=None, clip_denoised=True):
         time = time if time is not None else self.current_time.item()
         # pick the right student and distill from teacher
         with torch.no_grad():
-            student_i = int(math.floor(self.num_jumps * time / self.num_timesteps))
+            model, student_i = self.get_student(time)
             jump_start_time = int(student_i / self.num_jumps * self.num_timesteps)
             jump_size = time - jump_start_time
 
+            jump_start_t = torch.full((img.size(0),), jump_start_time, device=img.device).long()
+            x_jump_start_time = self.q_sample(img, jump_start_t)
+
             if jump_size > 1:
-                jump_start_t = torch.full((img.size(0),), jump_start_time, device=img.device).long()
-                x_jump_start_time = self.q_sample(img, jump_start_t)
-
                 # predict x0 using current (incomplete) student
-                x0_current_student = self.students[student_i](x_jump_start_time)
+                x0_current_student = model(x_jump_start_time, jump_start_t)
+                if clip_denoised:
+                    x0_current_student.clamp_(-1., 1.)
 
-                # find q(x_t | x_T, x_0) for the current time
-                # alpha = self.alphas_cumprod_prev[jump_start_time]
+                # sample q(x_t | x_T, x_0) for the current time
                 alpha_next = self.alphas_cumprod_prev[time]
-
-                # clip_denoised = False
-                # if clip_denoised:
-                #     x0_current_student.clamp_(-1., 1.)
-
                 pred_noise = self.predict_noise_from_start(x_jump_start_time, jump_start_t, x0_current_student)
                 x_t = x0_current_student * alpha_next.sqrt() + pred_noise * (1 - alpha_next).sqrt()
 
                 # predict next step using teacher
                 t = torch.full((img.size(0),), time, device=img.device).long()
                 x0_teacher = self.teacher(x_t, t)
+
+                if clip_denoised:
+                    x0_teacher.clamp_(-1., 1.)
             else:
                 x0_teacher = img
 
@@ -425,10 +436,9 @@ class RollingDistillationGaussianDiffusion(nn.Module):
         oldjump = int(math.floor(self.num_jumps * oldtime / self.num_timesteps))
         newjump = int(math.floor(self.num_jumps * time / self.num_timesteps))
 
-        if oldtime != time:
+        if oldtime != time and self.current_student is not None:
             # store current student into students
-            if self.current_student is not None:
-                self.students[oldjump].load_state_dict(copy.deepcopy(self.current_student.state_dict()))
+            self.students[oldjump].load_state_dict(copy.deepcopy(self.current_student.state_dict()))
 
         if oldjump != newjump:
             # copy the new student to current student
