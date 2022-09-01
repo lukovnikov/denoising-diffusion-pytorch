@@ -297,6 +297,7 @@ class RollingDistillationGaussianDiffusion(nn.Module):
 
             if clip_denoised:
                 x_start.clamp_(-1., 1.)
+                pred_noise = self.predict_noise_from_start(img, time_cond, x_start)
 
             if time_next > -1:
                 alpha_next = self.alphas_cumprod[time_next]
