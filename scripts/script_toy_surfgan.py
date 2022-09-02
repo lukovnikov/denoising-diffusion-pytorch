@@ -98,8 +98,8 @@ def run():
     numjumps = 1
     itersperstep=100
 
-    generators = [OneDModel(32, 3, notime=True) for _ in range(numjumps)]
-    discriminator = OneDModel(64, 3, notime=True, isdiscr=True)
+    generators = [OneDModel(32, 2, notime=True) for _ in range(numjumps)]
+    discriminator = OneDModel(32, 2, notime=True, isdiscr=True)
 
     x = torch.randn((5, 1, 1, 1))
     t = torch.rand((5,))
@@ -152,7 +152,7 @@ def run():
                 # do update of discriminator
                 discr_optimizer.zero_grad()
                 batch = next(dliter).to(device)
-                out = m.forward_discriminator(batch, time=step)
+                out = m.forward_discriminator(batch, time=0)
                 out["loss"].backward()
                 Dlosses.append(out["loss"].detach().cpu().item())
                 Daccs.append(out["acc"].detach().cpu().item())
@@ -162,7 +162,7 @@ def run():
                 # do update of generator
                 gen_optimizer.zero_grad()
                 batch = next(dliter).to(device)
-                out = m.forward_generator(batch, time=step)
+                out = m.forward_generator(batch, time=0)
                 out["loss"].backward()
                 Glosses.append(out["loss"].detach().cpu().item())
                 Gaccs.append(out["acc"].detach().cpu().item())
@@ -179,6 +179,9 @@ def run():
             if (step+1) % 10 == 0:
                 print("")
 
+    # TODO save current generator back to list of generators
+    # TODO: even better, don't use current generator
+    # Problem: generator doesn't follow discriminator
 
 
     print("done training")
