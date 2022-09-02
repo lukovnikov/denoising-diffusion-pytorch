@@ -388,7 +388,82 @@ class RollingDistillationGaussianDiffusion(nn.Module):
         loss = self.loss_fn(model_out, img, reduction='none')
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
 
-        return loss.mean()
+        return {"loss": loss.mean()}
+
+    def forward_discriminator_teacher(self, img, time=None, clip_denoised=True):
+        img = normalize_to_neg_one_to_one(img)
+        img, img2 = torch.chunk(img, 2, 0)
+
+        time = time if time is not None else self.current_time.item()
+        b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
+        assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
+        t = torch.full((b,), time, device=device).long()
+
+        with torch.no_grad():
+            # noise sample
+            noise = torch.randn_like(img)
+            x = self.q_sample(x_start=img, t=t, noise=noise)
+
+            # predict
+            model_out = self.teacher(x, t)
+            if clip_denoised:
+                model_out.clamp_(-1., 1.)
+
+            # sample posterior from predicted x0
+            if time > 0:
+                alpha_next = self.alphas_cumprod[time-1]
+                pred_noise = self.predict_noise_from_start(img, t, model_out)
+                fake = model_out * alpha_next.sqrt() + pred_noise * (1 - alpha_next).sqrt()
+            else:
+                fake = model_out
+
+            noise = torch.randn_like(img2)
+            real = self.q_sample(x_start=img2, t=t-1, noise=noise) if time > 0 else img2
+
+        discrinp = torch.cat([fake, real], 0)
+        disc_scores = self.discr(discrinp)
+        mult = torch.ones_like(disc_scores)
+        mult[len(img):] *= -1       # scores for real images are multiplied by -1
+
+        loss = torch.nn.functional.softplus(disc_scores * mult).mean()
+        acc = (disc_scores * mult < 0).float().mean()
+        return {"loss": loss, "acc": acc}
+
+    def forward_discriminator_student(self, img, time=None, clip_denoised=True):
+        img = normalize_to_neg_one_to_one(img)
+        img, img2 = torch.chunk(img, 2, 0)
+
+        time = time if time is not None else self.current_time.item()
+        b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
+        assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
+        t = torch.full((b,), time, device=device).long()
+
+        with torch.no_grad():
+            noise = torch.randn_like(img)
+
+
+            # noise sample
+            x = self.q_sample(x_start=img, t=t, noise=noise)
+
+            # predict
+            model_out = self.teacher(x, t)
+            if clip_denoised:
+                model_out.clamp_(-1., 1.)
+
+            # sample posterior from predicted x0
+            # TODO
+
+            noise = torch.randn_like(img2)
+            real = self.q_sample(x_start=img2, t=t - 1, noise=noise) if time > 0 else img2
+
+        discrinp = torch.cat([fake, real], 0)
+        disc_scores = self.discr(discrinp)
+        mult = torch.ones_like(disc_scores)
+        mult[len(img):] *= -1  # scores for real images are multiplied by -1
+
+        loss = torch.nn.functional.softplus(disc_scores * mult).mean()
+        acc = (disc_scores * mult < 0).float().mean()
+        return {"loss": loss, "acc": acc}
 
     def get_student(self, time):
         student_i = int(math.floor(self.num_jumps * time / self.num_timesteps))
@@ -430,7 +505,7 @@ class RollingDistillationGaussianDiffusion(nn.Module):
         loss = self.loss_fn(x0_student, x0_teacher, reduction='none')
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
 
-        return loss.mean()
+        return {"loss": loss.mean()}
 
     def set_current_time(self, time):
         oldtime = self.current_time.item()

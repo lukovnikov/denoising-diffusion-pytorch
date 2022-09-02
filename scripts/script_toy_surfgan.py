@@ -13,14 +13,16 @@ import random
 from denoising_diffusion_pytorch import GaussianDiffusion
 from denoising_diffusion_pytorch.denoising_diffusion_pytorch import SinusoidalPosEmb, unnormalize_to_zero_to_one
 from denoising_diffusion_pytorch.distillation import RollingDistillationGaussianDiffusion
+from denoising_diffusion_pytorch.surfgan import GaussianDiffusionSurfGAN
 
 
 class OneDModel(torch.nn.Module):
-    def __init__(self, dim=16, layers=3, notime=False, **kw):
+    def __init__(self, dim=16, layers=3, notime=False, isdiscr=False, **kw):
         super().__init__(**kw)
         self.channels = self.out_dim = 1
         self.self_condition = False
         self.notime = notime
+        self.isdiscr = isdiscr
         time_dim = dim * 4
 
         if not self.notime:
@@ -57,7 +59,10 @@ class OneDModel(torch.nn.Module):
         for layer in self.main[1:]:
             h = layer(h)
 
-        h = h[:, :, None, None]
+        if self.isdiscr:
+            return h[:, 0]
+        else:
+            h = h[:, :, None, None]
         return h
 
 
@@ -89,12 +94,12 @@ def repeater(dl):
 
 def run():
     batsize=256
-    numsteps = 500
-    numjumps = 4
-    itersperstep=20
-    teacher = OneDModel(64, 3, notime=True)
-    students = [OneDModel(32, 3, notime=True) for _ in range(numjumps)]
-    discriminator = OneDModel(64, 3, notime=True)
+    numsteps = 100
+    numjumps = 1
+    itersperstep=100
+
+    generators = [OneDModel(32, 3, notime=True) for _ in range(numjumps)]
+    discriminator = OneDModel(64, 3, notime=True, isdiscr=True)
 
     x = torch.randn((5, 1, 1, 1))
     t = torch.rand((5,))
@@ -103,8 +108,8 @@ def run():
     # y = m(x, t)
     # print(y)
 
-    diffusion = RollingDistillationGaussianDiffusion(
-        teacher=teacher, students=students, image_size=1, timesteps=numsteps, jumps=len(students))
+    m = GaussianDiffusionSurfGAN(
+        generators=generators, discriminator=discriminator, image_size=1, timesteps=numsteps, jumps=len(generators))
 
     ds = OneDDataset()
     dl = torch.utils.data.DataLoader(ds, batch_size=batsize)
@@ -124,70 +129,62 @@ def run():
     print(f"Total number of iterations: {totaliters} (~= {totaliters/len(dl)} epochs)")
 
     device = torch.device("cuda:3")
-    diffusion.to(device)
+    m.to(device)
 
-    teacher_optimizer = torch.optim.Adam(diffusion.teacher.parameters(), lr=1e-3, betas=(0.9, 0.99))
-    discr_optimizer = torch.optim.Adam(discriminator.parameters(), lr=1e-3, betas=(0.9, 0.99))
+    discr_optimizer = torch.optim.Adam(m.discriminator.parameters(), lr=1e-3, betas=(0.9, 0.99))
 
     initstep = 0
-    teacher_batchcount = 0
-    student_batchcount = 0
+    totalitercount = 0
 
-    with tqdm(initial=initstep, total=diffusion.num_timesteps) as pbar:
-        for step in reversed(range(initstep, diffusion.num_timesteps)):
-            teacher_losses = []
-            student_losses = []
+    with tqdm(initial=initstep, total=m.num_timesteps) as pbar:
+        for step in reversed(range(initstep, m.num_timesteps)):
+            Dlosses, Glosses, Daccs, Gaccs = [], [], [], []
+
+            newgenerator = m.set_current_time(step)
+            if newgenerator is not None:
+                gen_optimizer = torch.optim.Adam(newgenerator.parameters(), lr=1e-3, betas=(0.9, 0.99))
 
             numiters = itersperstep
-            if newstudent is not None:
+            if newgenerator is not None:
                 numiters *= 5
 
-            newstudent = diffusion.set_current_time(step)
-            if newstudent is not None:
-                student_optimizer = torch.optim.Adam(newstudent.parameters(), lr=1e-3, betas=(0.9, 0.99))
-
-            # PHASE I: train teacher for current step
-            for i in range(numiters):
+            for iter in range(numiters):
+                # do update of discriminator
+                discr_optimizer.zero_grad()
                 batch = next(dliter).to(device)
-                teacher_batchcount += 1
-                out = diffusion.forward_teacher(batch, time=step)
+                out = m.forward_discriminator(batch, time=step)
                 out["loss"].backward()
-                teacher_losses.append(out["loss"].cpu().item())
-                teacher_optimizer.step()
-                teacher_optimizer.zero_grad()
+                Dlosses.append(out["loss"].detach().cpu().item())
+                Daccs.append(out["acc"].detach().cpu().item())
+                discr_optimizer.step()
+                discr_optimizer.zero_grad()
 
-                pbar.set_description(f'Step {step}: Teacher loss: {np.mean(teacher_losses):.4f}, Updates: {teacher_batchcount}')
-
-            # PHASE II: train student for current step
-
-            for i in range(numiters):
+                # do update of generator
+                gen_optimizer.zero_grad()
                 batch = next(dliter).to(device)
-                student_batchcount += 1
-                out = diffusion.forward_student(batch, time=step)
+                out = m.forward_generator(batch, time=step)
                 out["loss"].backward()
-                student_losses.append(out["loss"].cpu().item())
-                student_optimizer.step()
-                student_optimizer.zero_grad()
+                Glosses.append(out["loss"].detach().cpu().item())
+                Gaccs.append(out["acc"].detach().cpu().item())
+                gen_optimizer.step()
+                gen_optimizer.zero_grad()
 
-                pbar.set_description(f'Teacher loss: {np.mean(teacher_losses):.4f}, '
-                                     f'Student loss: {np.mean(student_losses):.4f}, '
-                                     f'Updates: {teacher_batchcount},{student_batchcount}')
+                totalitercount += 1
+
+                pbar.set_description(f'Step: {step}: D: {np.mean(Dlosses):.4f}, {np.mean(Daccs):.4f} '
+                                     f'G: {np.mean(Glosses):.4f}, {np.mean(Gaccs):.4f} (iters: {totalitercount})')
 
             pbar.update(1)
 
             if (step+1) % 10 == 0:
-                print(f'\nTeacher loss: {np.mean(teacher_losses):.4f}, '
-                                     f'Student loss: {np.mean(student_losses):.4f}, '
-                                     f'Updates: {teacher_batchcount},{student_batchcount}')
-                # print(f'\nStep {step}: Teacher loss: {np.mean(teacher_losses):.4f}, '
-                #                     f'Updates: {teacher_batchcount}')
+                print("")
 
 
 
     print("done training")
 
-    diffusion.is_ddim_sampling = True
-    sampled_images = diffusion.sample(batch_size=1000)
+    m.is_ddim_sampling = True
+    sampled_images = m.sample(batch_size=1000)
     print(sampled_images.shape)  # (4, 3, 128, 128)
     sampled_images = sampled_images[:, 0, 0, 0]
     print(sampled_images)
