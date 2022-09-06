@@ -34,7 +34,7 @@ class DebugGaussianDiffusion(GaussianDiffusion):
         return img, imgacc, x0acc
 
     @torch.no_grad()
-    def ddim_sample(self, shape, x_T=None, clip_denoised=False):
+    def ddim_sample(self, shape, x_T=None, clip_denoised=False, return_trajectories=False):
         batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[
                                                                                  0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
         imgacc = []
@@ -77,10 +77,10 @@ class DebugGaussianDiffusion(GaussianDiffusion):
 
         img = unnormalize_to_zero_to_one(img)
 
-        if x_T is None:
-            return img, imgacc, x0acc
-        else:
+        if return_trajectories:
             return img, times, imgacc, x0acc
+        else:
+            return img
 
 
 class OneDModel(torch.nn.Module):

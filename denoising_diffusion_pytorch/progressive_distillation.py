@@ -34,18 +34,18 @@ class ProgressiveDistillationGaussianDiffusion(nn.Module):
         *,
         image_size,
         timesteps = 1000,
-        sampling_timesteps = None,
         loss_type = 'l2',
         objective = 'pred_x0',
         beta_schedule = 'cosine',
         p2_loss_weight_gamma = 0., # p2 loss weight, from https://arxiv.org/abs/2204.00227 - 0 is equivalent to weight of 1 across time - 1. is recommended
         p2_loss_weight_k = 1,
-        ddim_sampling_eta = 1.
     ):
         super().__init__()
         assert not (type(self) == ProgressiveDistillationGaussianDiffusion and model.channels != model.out_dim)
 
         self.model = model
+        self.ema = None #EMA(self.model, beta=0.99, power=3/4, update_every=1, update_after_step=1000)
+        self.teacher = None
         self.channels = self.model.channels
         self.self_condition = self.model.self_condition
 
@@ -71,12 +71,8 @@ class ProgressiveDistillationGaussianDiffusion(nn.Module):
         self.loss_type = loss_type
 
         # sampling related parameters
-
-        self.sampling_timesteps = default(sampling_timesteps, timesteps) # default num sampling timesteps to number of timesteps at training
-
-        assert self.sampling_timesteps <= timesteps
-        self.is_ddim_sampling = self.sampling_timesteps < timesteps
-        self.ddim_sampling_eta = ddim_sampling_eta
+        self.is_ddim_sampling = True
+        self.ddim_sampling_eta = 0.
 
         # helper function to register buffer from float64 to float32
 
@@ -112,6 +108,9 @@ class ProgressiveDistillationGaussianDiffusion(nn.Module):
 
         register_buffer('p2_loss_weight', (p2_loss_weight_k + alphas_cumprod / (1 - alphas_cumprod)) ** -p2_loss_weight_gamma)
 
+        # jump size
+        self.register_buffer('jumpsize', torch.tensor([1]).long())
+
     def predict_start_from_noise(self, x_t, t, noise):
         return (
             extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
@@ -133,8 +132,9 @@ class ProgressiveDistillationGaussianDiffusion(nn.Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def model_predictions(self, x, t, x_self_cond = None):
-        model_output = self.model(x, t, x_self_cond)
+    def model_predictions(self, x, t, x_self_cond = None, useteacher=False):
+        model = self.model if not useteacher else self.teacher
+        model_output = model(x, t, x_self_cond)
 
         if self.objective == 'pred_noise':
             pred_noise = model_output
@@ -193,42 +193,51 @@ class ProgressiveDistillationGaussianDiffusion(nn.Module):
         return img
 
     @torch.no_grad()
-    def ddim_sample(self, shape, clip_denoised = None):
-        clip_denoised = (self.objective != "pred_x0") if clip_denoised is None else clip_denoised
-        batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
+    def ddim_sample(self, shape, x_T=None, clip_denoised=False, return_trajectories=False):
+        batch, device, total_timesteps, eta, objective \
+            = shape[0], self.betas.device, self.num_timesteps, self.ddim_sampling_eta, self.objective
+        jumpsize = self.jumpsize[0].cpu().item()
+        imgacc = []
+        x0acc = []
 
-        times = torch.linspace(0., total_timesteps, steps = sampling_timesteps + 2)[:-1]
+        times = torch.linspace(-1, total_timesteps-1, steps=total_timesteps//jumpsize+1)
         times = list(reversed(times.int().tolist()))
         time_pairs = list(zip(times[:-1], times[1:]))
 
-        img = torch.randn(shape, device = device)
+        img = torch.randn(shape, device=device) if x_T is None else x_T
 
         x_start = None
 
-        for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
-            alpha = self.alphas_cumprod_prev[time]
-            alpha_next = self.alphas_cumprod_prev[time_next]
-
-            time_cond = torch.full((batch,), time, device = device, dtype = torch.long)
-
+        for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
+            time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
             self_cond = x_start if self.self_condition else None
-
             pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond)
 
             if clip_denoised:
                 x_start.clamp_(-1., 1.)
+                pred_noise = self.predict_noise_from_start(img, time_cond, x_start)
 
-            sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / max((1 - alpha), 1e-6)).sqrt()
+            alpha = self.alphas_cumprod[time]
+            alpha_next = self.alphas_cumprod_prev[time_next+1]
+            sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
             c = ((1 - alpha_next) - sigma ** 2).sqrt()
 
-            noise = torch.randn_like(img) if time_next > 0 else 0.
+            noise = torch.randn_like(img)
 
             img = x_start * alpha_next.sqrt() + \
                   c * pred_noise + \
                   sigma * noise
 
+            #imgacc.append(unnormalize_to_zero_to_one(img))
+            imgacc.append(img)
+            x0acc.append(unnormalize_to_zero_to_one(x_start))
+
         img = unnormalize_to_zero_to_one(img)
-        return img
+
+        if return_trajectories:
+            return img, times, imgacc, x0acc
+        else:
+            return img
 
     @torch.no_grad()
     def sample(self, batch_size = 16):
@@ -269,34 +278,67 @@ class ProgressiveDistillationGaussianDiffusion(nn.Module):
         else:
             raise ValueError(f'invalid loss type {self.loss_type}')
 
-    def p_losses(self, x_start, t, noise = None):
+    def p_losses(self, x_start, t, noise = None, clip_denoised=True):
         b, c, h, w = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
 
+        jumpsize = self.jumpsize[0].cpu().item()
         # noise sample
 
-        x = self.q_sample(x_start = x_start, t = t, noise = noise)
-
-        # if doing self-conditioning, 50% of the time, predict x_start from current set of times
-        # and condition with unet with that
-        # this technique will slow down training by 25%, but seems to lower FID significantly
-
-        x_self_cond = None
-        if self.self_condition and random() < 0.5:
-            with torch.no_grad():
-                x_self_cond = self.model_predictions(x, t).pred_x_start
-                x_self_cond.detach_()
+        x_t = self.q_sample(x_start = x_start, t = t, noise = noise)
 
         # predict and take gradient step
 
-        model_out = self.model(x, t, x_self_cond)
+        model_out = self.model(x_t, t)
 
-        if self.objective == 'pred_noise':
-            target = noise
-        elif self.objective == 'pred_x0':
-            target = x_start
-        else:
-            raise ValueError(f'unknown objective {self.objective}')
+        if self.teacher is None:        # then pretrain teacher on original timesteps
+            if self.objective == 'pred_noise':
+                target = noise
+            elif self.objective == 'pred_x0':
+                target = x_start
+            else:
+                raise ValueError(f'unknown objective {self.objective}')
+
+        else:       # compute target x_start using the teacher
+            # 1. Run DDIM sampler for two steps to get x_t-2
+            with torch.no_grad():
+                pred_noise, x_start, *_ = self.model_predictions(x_t, t, useteacher=True)
+
+                if clip_denoised:
+                    x_start.clamp_(-1., 1.)
+                    pred_noise = self.predict_noise_from_start(x_t, t, x_start)
+
+                alpha_next = extract(self.alphas_cumprod_prev, t-jumpsize // 2 + 1, x_t.shape)
+                x_tm1 = x_start * alpha_next.sqrt() + (1 - alpha_next).sqrt() * pred_noise
+
+                pred_noise, x_start, *_ = self.model_predictions(x_tm1, t - jumpsize // 2, useteacher=True)
+
+                if clip_denoised:
+                    x_start.clamp_(-1., 1.)
+                    pred_noise = self.predict_noise_from_start(x_tm1, t, x_start)
+
+                alpha_next = extract(self.alphas_cumprod_prev, t - jumpsize + 1, x_t.shape)
+                x_tm2 = x_start * alpha_next.sqrt() + (1 - alpha_next).sqrt() * pred_noise
+
+                # 2. compute x*_0 from x_t-2 and x_t as the new target
+                # x_tm2 = alpha_t-2.sqrt() * x*_0 + (1-alpha_t-2).sqrt() * pred_noise(x*_0)
+                # x_tm2 = alpha_tm2.sqrt() * x_star_0 + (1-alpha_tm2).sqrt() * (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x_star_0) / extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
+                # x_tm2 = alpha_tm2 * x_star_0 + (1-alpha_tm2) * (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t / extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) - (1-alpha_tm2) * x_star_0 / extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
+                # x_tm2 = (alpha_tm2 - (1-alpha_tm2) / extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)) * x_star_0 + (1-alpha_tm2) * (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t / extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape))
+                # x_star_0 = (x_tm2 - (1-alpha_tm2) * x_t * (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) / extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape))) \
+                #            / (alpha_tm2 - (1-alpha_tm2) / extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape))
+                sqrt_recip_alphas_cumprod_t = extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape)
+                sqrt_recipm1_alphas_cumprod_t = extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
+                x_star_0 = (x_tm2 - (1 - alpha_next).sqrt() * x_t * ( sqrt_recip_alphas_cumprod_t / sqrt_recipm1_alphas_cumprod_t)) \
+                                / (alpha_next.sqrt() - (1-alpha_next).sqrt() / sqrt_recipm1_alphas_cumprod_t)
+
+                # 3. check that x*_0 results in x_tm2 with the noise prediction equations
+                # _pred_noise = self.predict_noise_from_start(x_t, t, x_star_0)
+                # _x_tm2 = x_star_0 * alpha_next.sqrt() + (1 - alpha_next).sqrt() * _pred_noise
+                # if not torch.allclose(_x_tm2, x_tm2):
+                #     assert torch.allclose(_x_tm2, x_tm2)
+
+                target = x_star_0
 
         loss = self.loss_fn(model_out, target, reduction = 'none')
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
@@ -307,8 +349,22 @@ class ProgressiveDistillationGaussianDiffusion(nn.Module):
     def forward(self, img, *args, **kwargs):
         b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
         assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
-        t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
+        jumpsize = self.jumpsize[0].cpu().item()
+
+        t = (torch.randint(0, self.num_timesteps//jumpsize, (b,), device=device).long() + 1) * jumpsize - 1
 
         img = normalize_to_neg_one_to_one(img)
         return self.p_losses(img, t, *args, **kwargs)
+
+    def double_jump_size(self):
+        if self.ema is not None:        # initial denoising function is done using EMA because large losses at convergence
+            self.teacher = copy.deepcopy(self.ema.ema_model)
+            self.ema = None
+        else:
+            self.teacher = copy.deepcopy(self.model)
+        self.jumpsize = self.jumpsize * 2
+
+    def on_after_optim_step(self):
+        if self.ema is not None:
+            self.ema.update()
 
