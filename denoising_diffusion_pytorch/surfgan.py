@@ -146,7 +146,7 @@ class GaussianDiffusionSurfGAN(nn.Module):
         return ModelPrediction(pred_noise, x_start)
 
     @torch.no_grad()
-    def ddim_sample(self, shape, clip_denoised = False, x_T=None, return_trajectories=False):
+    def ddim_sample(self, shape, clip_denoised = True, x_T=None, return_trajectories=False):
         batch, device, total_timesteps, sampling_timesteps \
             = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps
 

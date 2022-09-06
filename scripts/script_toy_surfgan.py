@@ -96,7 +96,7 @@ def run():
     batsize=256
     numsteps = 100
     numjumps = 1
-    itersperstep=100
+    itersperstep=25
 
     generators = [OneDModel(32, 2, notime=True) for _ in range(numjumps)]
     discriminator = OneDModel(32, 2, notime=True, isdiscr=True)
@@ -131,10 +131,12 @@ def run():
     device = torch.device("cuda:3")
     m.to(device)
 
-    discr_optimizer = torch.optim.Adam(m.discriminator.parameters(), lr=1e-3, betas=(0.9, 0.99))
+    discr_optimizer = torch.optim.Adam(m.discriminator.parameters(), lr=1e-4, betas=(0.9, 0.99))
 
     initstep = 0
     totalitercount = 0
+
+    intermediate_gens = []
 
     with tqdm(initial=initstep, total=m.num_timesteps) as pbar:
         for step in reversed(range(initstep, m.num_timesteps)):
@@ -142,7 +144,7 @@ def run():
 
             newgenerator = m.set_current_time(step)
             if newgenerator is not None:
-                gen_optimizer = torch.optim.Adam(newgenerator.parameters(), lr=1e-3, betas=(0.9, 0.99))
+                gen_optimizer = torch.optim.Adam(newgenerator.parameters(), lr=1e-4, betas=(0.9, 0.99))
 
             numiters = itersperstep
             if newgenerator is not None:
@@ -176,23 +178,34 @@ def run():
 
             pbar.update(1)
 
+            sampled_images = m.sample(batch_size=1000)
+            sampled_images = sampled_images[:, 0, 0, 0].cpu().numpy()
+            sampled_hist, _ = np.histogram(sampled_images, density=True, bins=100, range=(-2, 2))
+            sampled_hist = sampled_hist / sampled_hist.max()
+            intermediate_gens.append(sampled_hist)
+
             if (step+1) % 10 == 0:
                 print("")
 
-    # TODO save current generator back to list of generators
-    # TODO: even better, don't use current generator
+    m.set_current_time(-1)
     # Problem: generator doesn't follow discriminator
 
 
     print("done training")
 
-    m.is_ddim_sampling = True
+    imdata = np.stack(intermediate_gens, 0)
+    plt.imshow(imdata)
+    plt.show()
+
+    print(imdata[-1])
+    """
     sampled_images = m.sample(batch_size=1000)
     print(sampled_images.shape)  # (4, 3, 128, 128)
     sampled_images = sampled_images[:, 0, 0, 0]
     print(sampled_images)
     _ = plt.hist(sampled_images.cpu().numpy(), density=True, bins=100)
     plt.show()
+    """
 
 if __name__ == '__main__':
     run()
