@@ -94,9 +94,9 @@ def repeater(dl):
 
 def run():
     batsize=256
-    numsteps = 100
+    numsteps = 200
     numjumps = 1
-    itersperstep=25
+    itersperstep=100
 
     generators = [OneDModel(32, 2, notime=True) for _ in range(numjumps)]
     discriminator = OneDModel(32, 2, notime=True, isdiscr=True)
@@ -154,7 +154,7 @@ def run():
                 # do update of discriminator
                 discr_optimizer.zero_grad()
                 batch = next(dliter).to(device)
-                out = m.forward_discriminator(batch, time=0)
+                out = m.forward_discriminator(batch, time=step)
                 out["loss"].backward()
                 Dlosses.append(out["loss"].detach().cpu().item())
                 Daccs.append(out["acc"].detach().cpu().item())
@@ -164,7 +164,7 @@ def run():
                 # do update of generator
                 gen_optimizer.zero_grad()
                 batch = next(dliter).to(device)
-                out = m.forward_generator(batch, time=0)
+                out = m.forward_generator(batch, time=step)
                 out["loss"].backward()
                 Glosses.append(out["loss"].detach().cpu().item())
                 Gaccs.append(out["acc"].detach().cpu().item())
@@ -180,11 +180,11 @@ def run():
 
             sampled_images = m.sample(batch_size=1000)
             sampled_images = sampled_images[:, 0, 0, 0].cpu().numpy()
-            sampled_hist, _ = np.histogram(sampled_images, density=True, bins=100, range=(-2, 2))
+            sampled_hist, _ = np.histogram(sampled_images, density=True, bins=100, range=(-0.1, 1.1))
             sampled_hist = sampled_hist / sampled_hist.max()
             intermediate_gens.append(sampled_hist)
 
-            if (step+1) % 10 == 0:
+            if (step+1) % 50 == 0:
                 print("")
 
     m.set_current_time(-1)
@@ -197,7 +197,7 @@ def run():
     plt.imshow(imdata)
     plt.show()
 
-    print(imdata[-1])
+    print(intermediate_gens[-1])
     """
     sampled_images = m.sample(batch_size=1000)
     print(sampled_images.shape)  # (4, 3, 128, 128)

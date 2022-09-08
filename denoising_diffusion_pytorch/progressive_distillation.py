@@ -218,10 +218,10 @@ class ProgressiveDistillationGaussianDiffusion(nn.Module):
             return img
 
     @torch.no_grad()
-    def sample(self, batch_size = 16):
+    def sample(self, batch_size = 16, x_T=None, return_trajectories=False):
         image_size, channels = self.image_size, self.channels
         sample_fn = self.ddim_sample
-        return sample_fn((batch_size, channels, image_size, image_size))
+        return sample_fn((batch_size, channels, image_size, image_size), x_T=x_T, return_trajectories=return_trajectories)
 
     @torch.no_grad()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
@@ -316,17 +316,17 @@ class ProgressiveDistillationGaussianDiffusion(nn.Module):
                                 / (alpha_next.sqrt() - (1-alpha_next).sqrt() / sqrt_recipm1_alphas_cumprod_t)
 
                 # 3. check that x*_0 results in x_tm2 with the noise prediction equations
-                _pred_noise = self.predict_noise_from_start(x_t, t, x_star_0)
-                _x_tmX = x_star_0 * alpha_next.sqrt() + (1 - alpha_next).sqrt() * _pred_noise
-                # if not torch.allclose(_x_tm2, x_tm2):
-                assert torch.allclose(_x_tmX, x_tmX, atol=1e-6)
+                # _pred_noise = self.predict_noise_from_start(x_t, t, x_star_0)
+                # _x_tmX = x_star_0 * alpha_next.sqrt() + (1 - alpha_next).sqrt() * _pred_noise
+                # # if not torch.allclose(_x_tm2, x_tm2):
+                # assert torch.allclose(_x_tmX, x_tmX, atol=1e-6)
 
                 target = x_star_0
 
-            # alpha_t = extract(self.alphas_cumprod, t, x_t.shape)
-            # lossweights = (alpha_t / (1 - alpha_t)).clamp_min(1)
+            alpha_t = extract(self.alphas_cumprod, t, x_t.shape)
+            lossweights = (alpha_t / (1 - alpha_t)).clamp_min(1)
             # lossweights = (alpha_t / (1 - alpha_t)) + 1
-            lossweights = 1.
+            # lossweights = 1.
 
         loss = self.loss_fn(model_out, target, reduction = 'none')
         loss = reduce(loss, 'b ... -> b (...)', 'mean')

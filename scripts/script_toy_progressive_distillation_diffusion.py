@@ -78,9 +78,6 @@ class OneDDataset(torch.utils.data.Dataset):
             yield self[i]
 
 
-
-
-
 def run():
     m = OneDModel(64)
     x = torch.randn((5, 1, 1, 1))

@@ -237,7 +237,7 @@ class GaussianDiffusionSurfGAN(nn.Module):
     #           3. repeat steps 1 and 2 for a certain number of batches
     #       Set t <- t + 1 and repeat Phases I and II
 
-    def forward_discriminator(self, img, time=None, clip_denoised=True):
+    def forward_discriminator(self, img, time=None, clip_denoised=False):
         img = normalize_to_neg_one_to_one(img)
         img, img2 = torch.chunk(img, 2, 0)
 
@@ -269,9 +269,9 @@ class GaussianDiffusionSurfGAN(nn.Module):
         discr_inp = torch.cat([generated, real], 0)
         discr_scores = self.discriminator(discr_inp, t)
 
-        target = torch.ones_like(discr_scores)
-        target[:len(img)] = 0
-        loss = F.binary_cross_entropy_with_logits(discr_scores, target)
+        fakeloss = -torch.log(1-torch.sigmoid(discr_scores[:len(img)]))
+        realloss = -torch.log(torch.sigmoid(discr_scores[len(img):]))
+        loss = torch.cat([fakeloss, realloss], 0)
 
         # mult = torch.ones_like(discr_scores)
         # mult[len(img):] = -1
@@ -287,7 +287,7 @@ class GaussianDiffusionSurfGAN(nn.Module):
         jump_size = jump_start_time - time + 1
         return self.generators[jump_id], jump_id, jump_start_time, jump_size
 
-    def forward_generator(self, img, time=None, clip_denoised=True):
+    def forward_generator(self, img, time=None, clip_denoised=False):
         time = time if time is not None else self.current_time.item()
         # pick the right generator and train using discriminator
         _, _, jump_start_time, jump_size = self.get_generator(time)
@@ -310,8 +310,8 @@ class GaussianDiffusionSurfGAN(nn.Module):
             # run through discriminator
             discr_score = self.discriminator(generated, t)
 
-            # loss = F.softplus(-discr_score)
-            loss = F.binary_cross_entropy_with_logits(discr_score, torch.ones_like(discr_score))
+            #loss = F.softplus(-discr_score)
+            loss = torch.log(1-torch.sigmoid(discr_score))
             acc = (discr_score > 0).float()
         else:       # train generator to do one step of denoising
             assert False, "don't do this yet"
