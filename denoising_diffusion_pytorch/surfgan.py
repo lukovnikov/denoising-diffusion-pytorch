@@ -260,6 +260,7 @@ class GaussianDiffusionSurfGAN(nn.Module):
             alpha_next = self.alphas_cumprod_prev[time]
             pred_noise = self.predict_noise_from_start(x_jump_start_time, jump_start_t, x0_current_G)
             generated = x0_current_G * alpha_next.sqrt() + pred_noise * (1 - alpha_next).sqrt()
+
             # REAL
             noise = torch.randn_like(img2)
             real = self.q_sample(x_start=img2, t=t, noise=noise) if time > 0 else img2
@@ -267,11 +268,16 @@ class GaussianDiffusionSurfGAN(nn.Module):
         # run through discriminator
         discr_inp = torch.cat([generated, real], 0)
         discr_scores = self.discriminator(discr_inp, t)
-        mult = torch.ones_like(discr_scores)
-        mult[len(img):] = -1
-        discr_scores *= mult
 
-        loss = F.softplus(discr_scores)
+        target = torch.ones_like(discr_scores)
+        target[:len(img)] = 0
+        loss = F.binary_cross_entropy_with_logits(discr_scores, target)
+
+        # mult = torch.ones_like(discr_scores)
+        # mult[len(img):] = -1
+        # discr_scores *= mult
+        #
+        # loss = F.softplus(discr_scores)
         acc = (discr_scores < 0).float()
         return {"loss": loss.mean(), "acc": acc.mean()}
 
@@ -304,7 +310,8 @@ class GaussianDiffusionSurfGAN(nn.Module):
             # run through discriminator
             discr_score = self.discriminator(generated, t)
 
-            loss = F.softplus(-discr_score)
+            # loss = F.softplus(-discr_score)
+            loss = F.binary_cross_entropy_with_logits(discr_score, torch.ones_like(discr_score))
             acc = (discr_score > 0).float()
         else:       # train generator to do one step of denoising
             assert False, "don't do this yet"

@@ -128,7 +128,7 @@ def run():
     totaliters = itersperstep * numsteps
     print(f"Total number of iterations: {totaliters} (~= {totaliters/len(dl)} epochs)")
 
-    device = torch.device("cuda:3")
+    device = torch.device("cuda:0")
     m.to(device)
 
     discr_optimizer = torch.optim.Adam(m.discriminator.parameters(), lr=1e-4, betas=(0.9, 0.99))

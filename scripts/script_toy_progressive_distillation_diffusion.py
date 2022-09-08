@@ -91,7 +91,10 @@ def run():
     # print(y)
     timesteps = 512
 
-    diffusion = ProgressiveDistillationGaussianDiffusion(model=m, image_size=1, timesteps=timesteps)
+    diffusion = ProgressiveDistillationGaussianDiffusion(model=m, image_size=1, timesteps=timesteps,  #)
+                                                         jumpsched=[1, 8, 64, 256, 512])
+                                                         # jumpsched = [1, 2,4,8,16,32, 64, 128, 256, 512])
+                                                         # jumpsched = 2)
 
     ds = OneDDataset()
     dl = torch.utils.data.DataLoader(ds, batch_size=256)
@@ -103,11 +106,9 @@ def run():
     # plt.show()
 
     step = 0
-    epochs = [1000]
-    _timesteps = timesteps
-    while _timesteps > 1:
-        epochs.append(100)
-        _timesteps /= 2
+    epochs = [2000]
+    for _ in diffusion.jumpsched[1:]:
+        epochs.append(400)
 
     _epochs = deepcopy(epochs)
 
@@ -141,12 +142,12 @@ def run():
 
             epochs[0] -= 1
             if epochs[0] == 0:
-                print(f"doubling jump size: {diffusion.jumpsize.item()*2}")
                 models.append(deepcopy(diffusion))
-                diffusion.double_jump_size()
                 epochs.pop(0)
                 if len(epochs) == 0:
                     break
+                diffusion.increase_jump_size()
+                print(f"increased jump size from {diffusion.get_prev_jump_size()} to {diffusion.get_jump_size()}")
 
             if step % (len(dl) * 50) == 0:
                 print("")
